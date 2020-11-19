@@ -116,7 +116,7 @@ class FiLMedConvBlock_context(nn.Module):
                 context_tile = tile_visu * \
                     fword * context_score.view(B, 1, N).repeat(1, Dlang, 1,)
 
-        attn_feat = F.tanh(self.attn_map(context_tile))
+        attn_feat = torch.tanh(self.attn_map(context_tile))
         attn_score = self.attn_score(attn_feat).squeeze(1)
         mask_score = mask_softmax(attn_score,word_mask,lstm=self.lstm)
         attn_lang = torch.matmul(mask_score.view(B,1,N),fword.permute(0,2,1))
@@ -130,7 +130,7 @@ class FiLMedConvBlock_context(nn.Module):
             film_param = self.gamme_decode(attn_lang)
             film_param = film_param.view(B,2*self.emb_size,1,1).repeat(1,1,H,W)
             gammas, betas = torch.split(film_param, self.emb_size, dim=1)
-            gammas, betas = F.tanh(gammas), F.tanh(betas)
+            gammas, betas = torch.tanh(gammas), torch.tanh(betas)
 
             ## modulate visu feature
             fmodu = self.bn1(self.conv1(torch.cat([fvisu,fcoord],dim=1)))
@@ -160,15 +160,20 @@ class FiLMedConvBlock_multihop(nn.Module):
         self.intmd = intmd
         self.lstm = lstm
         self.erasing = erasing
+        self.dyconv = Dynamic_conv2d(emb_size, emb_size, 3, 1, 1, 1)
         if self.fusion=='cat':
             self.cont_size = emb_size*2
 
         self.modulesdict = nn.ModuleDict()
         modules = OrderedDict()
+        '''
         modules["film0"] = FiLMedConvBlock_context(textdim=textdim,visudim=emb_size,contextdim=emb_size,emb_size=emb_size,fusion=fusion,lstm=self.lstm)
         for n in range(1,NFilm):
             modules["conv%d"%n] = ConvBatchNormReLU(emb_size, emb_size, 3, 1, 1, 1)
             modules["film%d"%n] = FiLMedConvBlock_context(textdim=textdim,visudim=emb_size,contextdim=self.cont_size,emb_size=emb_size,fusion=fusion,lstm=self.lstm)
+        '''
+        modules["selfconv"] = self.dyconv
+        modules["selffilm"] = FiLMedConvBlock_context(textdim=textdim,visudim=emb_size,contextdim=self.cont_size,emb_size=emb_size,fusion=fusion,lstm=self.lstm)
         self.modulesdict.update(modules)
 
     def forward(self, fvisu, fword, fcoord, weight=None,fsent=None,word_mask=None):
@@ -176,12 +181,29 @@ class FiLMedConvBlock_multihop(nn.Module):
         B, N, Dlang = fword.size()
         intmd_feat, attnscore_list = [], []
 
-        x, _, attn_score = self.modulesdict["film0"](fvisu, fword, Variable(torch.ones(B,N).cuda()), fcoord, fsent=fsent,word_mask=word_mask)
-        attnscore_list.append(attn_score.view(B,N,1,1))
+        #x, _, attn_score = self.modulesdict["film0"](fvisu, fword, Variable(torch.ones(B,N).cuda()), fcoord, fsent=fsent,word_mask=word_mask)
+        #attnscore_list.append(attn_score.view(B,N,1,1))
+        '''
         if self.intmd:
             intmd_feat.append(x)
         if self.NFilm==1:
             intmd_feat = [x]
+        '''
+        x = fvisu
+        score = Variable(torch.ones(B,N).cuda())
+        for n in range(0,self.NFilm):
+            x = self.modulesdict["selfconv"](x)
+            x, _, attn_score = self.modulesdict["selffilm"](fvisu, fword, score, fcoord, fsent=fsent,word_mask=word_mask)
+            attnscore_list.append(attn_score.view(B,N,1,1))
+            score_list = [mask_softmax(score.squeeze(2).squeeze(2),word_mask,lstm=self.lstm) for score in attnscore_list]
+
+            score = torch.clamp(torch.max(torch.stack(score_list, dim=1), dim=1, keepdim=False)[0],min=0.,max=1.)
+            score = 1 - score
+            if self.intmd:
+                intmd_feat.append(x)
+            elif n==self.NFilm-1:
+                intmd_feat = [x]
+        '''
         for n in range(1,self.NFilm):
             score_list = [mask_softmax(score.squeeze(2).squeeze(2),word_mask,lstm=self.lstm) for score in attnscore_list]
 
@@ -193,4 +215,59 @@ class FiLMedConvBlock_multihop(nn.Module):
                 intmd_feat.append(x)
             elif n==self.NFilm-1:
                 intmd_feat = [x]
+        '''
         return intmd_feat, attnscore_list
+
+class Dynamic_conv2d(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, K=4,):
+        super(Dynamic_conv2d, self).__init__()
+        assert in_planes%groups==0
+        self.in_planes = in_planes
+        self.out_planes = out_planes
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        self.bias = bias
+        self.K = K
+        self.attention = attention2d(in_planes, K, )
+
+        self.weight = nn.Parameter(torch.Tensor(K, out_planes, in_planes//groups, kernel_size, kernel_size), requires_grad=True)
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(K, out_planes))
+        else:
+            self.bias = None
+
+
+    def forward(self, x):#将batch视作维度变量，进行组卷积，因为组卷积的权重是不同的，动态卷积的权重也是不同的
+        softmax_attention = self.attention(x)
+        batch_size, in_planes, height, width = x.size()
+        x = x.view(1, -1, height, width)# 变化成一个维度进行组卷积
+        weight = self.weight.view(self.K, -1)
+
+        # 动态卷积的权重的生成， 生成的是batch_size个卷积参数（每个参数不同）
+        aggregate_weight = torch.mm(softmax_attention, weight).view(-1, self.in_planes, self.kernel_size, self.kernel_size)
+        if self.bias is not None:
+            aggregate_bias = torch.mm(softmax_attention, self.bias).view(-1)
+            output = F.conv2d(x, weight=aggregate_weight, bias=aggregate_bias, stride=self.stride, padding=self.padding,
+                              dilation=self.dilation, groups=self.groups*batch_size)
+        else:
+            output = F.conv2d(x, weight=aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
+                              dilation=self.dilation, groups=self.groups * batch_size)
+
+        output = output.view(batch_size, self.out_planes, output.size(-2), output.size(-1))
+        return output
+class attention2d(nn.Module):
+    def __init__(self, in_planes, K,):
+        super(attention2d, self).__init__()
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(in_planes, K, 1,)
+        self.fc2 = nn.Conv2d(K, K, 1,)
+
+    def forward(self, x):
+        x = self.avgpool(x)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.fc2(x).view(x.size(0), -1)
+        return F.softmax(x, 1)

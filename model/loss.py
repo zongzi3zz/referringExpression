@@ -39,7 +39,7 @@ def yolo_loss(input, target, gi, gj, best_n_list, w_coord=5., w_neg=1./5, size_a
     pred_bbox = Variable(torch.zeros(batch,4).cuda())
     gt_bbox = Variable(torch.zeros(batch,4).cuda())
     for ii in range(batch):
-        pred_bbox[ii, 0:2] = F.sigmoid(input[ii,best_n_list[ii],0:2,gj[ii],gi[ii]])
+        pred_bbox[ii, 0:2] = torch.sigmoid(input[ii,best_n_list[ii],0:2,gj[ii],gi[ii]])
         pred_bbox[ii, 2:4] = input[ii,best_n_list[ii],2:4,gj[ii],gi[ii]]
         gt_bbox[ii, :] = target[ii,best_n_list[ii],:4,gj[ii],gi[ii]]
     loss_x = mseloss(pred_bbox[:,0], gt_bbox[:,0])
